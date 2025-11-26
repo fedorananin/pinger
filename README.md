@@ -90,6 +90,16 @@ docker run -d -p 8088:80 --name pinger -e API_KEY=supersecret123 --restart unles
 Now requests without the key will not work. You need to add `&key=supersecret123`:
 `http://localhost:8088/?host=google.com&key=supersecret123`
 
+### Environment Variables
+
+- `API_KEY` (optional): If set, all requests must include a matching `key` query parameter for authentication.
+- `CONCURRENCY_LIMIT` (optional): Limits the number of concurrent ping/HTTP checks. Defaults to `20`. Set a lower value if your server has limited resources, or a higher value if you have plenty and expect high load.
+
+For example, to run with an API key and a concurrency limit of 10:
+```bash
+docker run -d -p 8088:80 --name pinger -e API_KEY=supersecret123 -e CONCURRENCY_LIMIT=10 --restart unless-stopped fedorananin/pinger
+```
+
 ---
 
 ## 🛠 How to Build and Run Yourself (Without Docker)

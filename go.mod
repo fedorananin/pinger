@@ -1,3 +1,3 @@
-module pinger-service
+module github.com/fedorananin/pinger
 
 go 1.21

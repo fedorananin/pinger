@@ -1,137 +1,203 @@
 package main
 
 import (
-    "encoding/json"
-    "fmt"
-    "net/http"
-    "os"
-    "os/exec"
-    "regexp"
-    "strconv"
-    "strings"
-    "time"
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"os/exec"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
 )
 
-// Структура ответа
+// Response structure
 type Response struct {
-    Host   string  `json:"host"`
-    Type   string  `json:"type"`
-    Result float64 `json:"result"` // Используем float для всего (http код тоже число)
-    Error  string  `json:"error,omitempty"`
+	Host   string `json:"host"`
+	Type   string `json:"type"`
+	Result any    `json:"result"` // Always include result, 0 on error
+	Error  string `json:"error,omitempty"`
 }
 
-var apiKey string
+var (
+	apiKey string
+	// Semaphore to limit concurrent checks (DoS/OOM protection)
+	concurrencyLimit chan struct{} // Declared here, initialized in main
+)
 
 func main() {
-    // Получаем ключ при старте
-    apiKey = os.Getenv("API_KEY")
-    if apiKey == "" {
-        fmt.Println("WARNING: API_KEY not set!")
-    }
+	// Get key at startup
+	apiKey = os.Getenv("API_KEY")
+	if apiKey == "" {
+		log.Println("WARNING: API_KEY not set!")
+	}
 
-    http.HandleFunc("/", handleRequest)
-    
-    // Запускаем сервер
-    fmt.Println("Server started on :80")
-    if err := http.ListenAndServe(":80", nil); err != nil {
-        panic(err)
-    }
+	// Get concurrency limit from env var, default to 20
+	limitStr := os.Getenv("CONCURRENCY_LIMIT")
+	limit := 20 // Default value
+	if limitStr != "" {
+		if parsedLimit, err := strconv.Atoi(limitStr); err == nil && parsedLimit > 0 {
+			limit = parsedLimit
+		} else {
+			log.Printf("WARNING: Invalid CONCURRENCY_LIMIT '%s', using default %d", limitStr, limit)
+		}
+	}
+	concurrencyLimit = make(chan struct{}, limit) // Initialize with the specified limit
+	log.Printf("Concurrency limit set to %d", limit)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", handleRequest)
+
+	// Configure server
+	server := &http.Server{
+		Addr:         ":80",
+		Handler:      mux,
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  120 * time.Second,
+	}
+
+	log.Println("Server started on :80")
+	if err := server.ListenAndServe(); err != nil {
+		log.Fatal(err)
+	}
 }
 
 func handleRequest(w http.ResponseWriter, r *http.Request) {
-    w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/json")
 
-    // 1. Проверка API-ключа
-    query := r.URL.Query()
-    userKey := query.Get("key")
+	// Helper function to send JSON error
+	sendError := func(status int, msg string) {
+		w.WriteHeader(status)
+		if err := json.NewEncoder(w).Encode(map[string]string{"error": msg}); err != nil {
+			log.Printf("Failed to write error response: %v", err)
+		}
+	}
 
-    if apiKey != "" && userKey != apiKey {
-        w.WriteHeader(http.StatusForbidden)
-        json.NewEncoder(w).Encode(map[string]string{"error": "Auth failed"})
-        return
-    }
+	// 1. API Key Check
+	query := r.URL.Query()
+	userKey := query.Get("key")
 
-    // 2. Валидация параметров
-    host := query.Get("host")
-    if host == "" {
-        w.WriteHeader(http.StatusBadRequest)
-        json.NewEncoder(w).Encode(map[string]string{"error": "host required"})
-        return
-    }
+	if apiKey != "" && userKey != apiKey {
+		sendError(http.StatusForbidden, "Auth failed")
+		return
+	}
 
-    // 3. Выбор метода
-    method := query.Get("method")
-    if method == "" {
-        method = "ping"
-    }
+	// 2. Parameter Validation
+	host := query.Get("host")
+	if host == "" {
+		sendError(http.StatusBadRequest, "host required")
+		return
+	}
 
-    var result float64
+	// 3. Concurrency Limiting
+	// Try to acquire a slot in the semaphore
+	select {
+	case concurrencyLimit <- struct{}{}:
+		// Slot acquired, release on function exit
+		defer func() { <-concurrencyLimit }()
+	case <-r.Context().Done():
+		// Client disconnected while waiting
+		return
+	default:
+		// All slots busy, server overloaded
+		sendError(http.StatusServiceUnavailable, "Server is too busy, try again later")
+		return
+	}
 
-    // 4. Выполнение
-    switch method {
-    case "http":
-        result = checkHTTP(host, "http")
-    case "https":
-        result = checkHTTP(host, "https")
-    default: // ping
-        method = "ping"
-        result = checkPing(host)
-    }
+	// 4. Method Selection
+	method := query.Get("method")
+	if method != "http" && method != "https" {
+		method = "ping"
+	}
 
-    // 5. Ответ
-    resp := Response{
-        Host:   host,
-        Type:   method,
-        Result: result,
-    }
-    json.NewEncoder(w).Encode(resp)
+	var result any
+	var err error
+	ctx := r.Context() // Pass request context to cancel operations
+
+	// 5. Execution
+	switch method {
+	case "http":
+		result, err = checkHTTP(ctx, host, "http")
+	case "https":
+		result, err = checkHTTP(ctx, host, "https")
+	default: // ping
+		result, err = checkPing(ctx, host)
+	}
+
+	// 6. Response
+	resp := Response{
+		Host: host,
+		Type: method,
+	}
+
+	if err != nil {
+		resp.Error = err.Error()
+		resp.Result = 0 // Set result to 0 on error as requested
+	} else {
+		resp.Result = result
+	}
+
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		log.Printf("JSON encode error: %v", err)
+	}
 }
 
-func checkPing(host string) float64 {
-    // В Go exec.Command безопаснее shell_exec, так как аргументы экранируются
-    // Но для надежности запускаем именно ping
-    // -c 3 (пакета), -W 2 (таймаут сек), -q (тихий режим)
-    cmd := exec.Command("ping", "-c", "3", "-W", "2", "-q", host)
-    output, err := cmd.CombinedOutput()
+func checkPing(ctx context.Context, host string) (float64, error) {
+	// Use CommandContext to cancel ping if user request is cancelled
+	cmd := exec.CommandContext(ctx, "ping", "-c", "3", "-W", "2", "-q", host)
+	output, err := cmd.CombinedOutput()
 
-    if err != nil {
-        return 0
-    }
+	if err != nil {
+		return 0, fmt.Errorf("ping failed: host unreachable or timeout")
+	}
 
-    // Парсим вывод Linux ping (ищем rtt min/avg/max/mdev)
-    // Пример: rtt min/avg/max/mdev = 10.100/15.200/20.300/1.200 ms
-    re := regexp.MustCompile(`(?m)/(\d+\.\d+)/(\d+\.\d+)/`)
-    matches := re.FindStringSubmatch(string(output))
+	// Parse Linux ping output
+	re := regexp.MustCompile(`(?m)/(\d+\.\d+)/(\d+\.\d+)/`)
+	matches := re.FindStringSubmatch(string(output))
 
-    if len(matches) >= 3 {
-        val, _ := strconv.ParseFloat(matches[2], 64) // Берем avg (2-я группа)
-        return val
-    }
+	if len(matches) >= 3 {
+		val, err := strconv.ParseFloat(matches[2], 64)
+		if err != nil {
+			return 0, fmt.Errorf("parse error: %w", err)
+		}
+		// Check for "0" in case of bad parse
+		if val <= 0 {
+			return 0, fmt.Errorf("invalid ping result: %v", val)
+		}
+		return val, nil
+	}
 
-    return 0
+	return 0, fmt.Errorf("could not parse ping output")
 }
 
-func checkHTTP(host, scheme string) float64 {
-    // Убираем протокол если юзер его ввел сам
-    host = strings.TrimPrefix(host, "http://")
-    host = strings.TrimPrefix(host, "https://")
-    
-    url := fmt.Sprintf("%s://%s", scheme, host)
+func checkHTTP(ctx context.Context, host, scheme string) (int, error) {
+	host = strings.TrimPrefix(host, "http://")
+	host = strings.TrimPrefix(host, "https://")
 
-    client := &http.Client{
-        Timeout: 5 * time.Second,
-        // Для HTTPS не проверяем валидность сертификата (как в PHP примере)
-        Transport: &http.Transport{
-            TLSClientConfig: nil, // Можно добавить InsecureSkipVerify: true если надо
-        },
-    }
+	url := fmt.Sprintf("%s://%s", scheme, host)
 
-    // Делаем HEAD запрос (только заголовки)
-    resp, err := client.Head(url)
-    if err != nil {
-        return 0
-    }
-    defer resp.Body.Close()
+	// Create request with context
+	req, err := http.NewRequestWithContext(ctx, "HEAD", url, nil)
+	if err != nil {
+		return 0, err
+	}
 
-    return float64(resp.StatusCode)
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: nil,
+		},
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+
+	return resp.StatusCode, nil
 }
